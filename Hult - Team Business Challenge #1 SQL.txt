@@ -1,0 +1,278 @@
+/* Authors: Polina Afanasyeva, Hafez Bajammal,
+			Kei Iwawaki, Luis Arellano, 
+			Barabara Asamoah, Waseeq Israr Qureshi */
+
+USE invest;
+/*This will create a procedure using the tickers as inputs
+and giving the covariance of the two tickers as outputs, this was used
+to create the covariance matrix for a single portfolio
+
+We copied the data of the tickers in a single client's portfolio into our
+local database to run this procedure since we are not allowed to create procedures
+in the main database*/
+
+DROP PROCEDURE IF EXISTS `invest`.`T7_COVAR`;
+
+-- Create procedure
+DELIMITER $$
+CREATE PROCEDURE `invest`.`T7_COVAR`(IN `ticker_1` VARCHAR(10), IN `ticker_2` VARCHAR(10))
+	READS SQL DATA
+BEGIN
+
+-- Create table with the information on ticker 1
+WITH 
+`RT1` AS ((SELECT `date`, `ticker`,`security_name`,
+	ln(`value`/`lagged_price`) AS `returns`
+FROM
+	(SELECT `pcn`.`date`,`pcn`.`value`,`pcn`.`ticker`,`sml`.`security_name`,
+	LAG(`value`,1) OVER (PARTITION BY `ticker` ORDER BY `date`) AS `lagged_price`
+FROM `invest`.`pricing_daily_new` AS `pcn`
+INNER JOIN `security_masterlist` AS `sml` 
+	ON `sml`.`ticker` = `pcn`.`ticker`
+WHERE `price_type` = 'Adjusted'
+AND `pcn`.`ticker` = `ticker_1`
+AND TIMESTAMPDIFF(DAY,`pcn`.`date`,'2022-09-09')<=(913)) A)),
+
+-- Create table with the information on ticker 2
+`RT2` AS ((SELECT `date`, `ticker`,`security_name`,
+	ln(`value`/`lagged_price`) AS `returns`
+FROM
+	(SELECT `pcn`.`date`,`pcn`.`value`,`pcn`.`ticker`,`sml`.`security_name`,
+	LAG(`value`,1) OVER (PARTITION BY `ticker` ORDER BY `date`) AS `lagged_price`
+FROM `invest`.`pricing_daily_new` AS `pcn`
+INNER JOIN `security_masterlist` AS `sml` 
+	ON `sml`.`ticker` = `pcn`.`ticker`
+WHERE `price_type` = 'Adjusted'
+AND `pcn`.`ticker` = `ticker_2`
+AND TIMESTAMPDIFF(DAY,`pcn`.`date`,'2022-09-09')<=(365)) A))
+
+-- Join the tables on dates and find the covariance between the tickers
+
+SELECT (AVG(`LEN`*`TTWO`)-AVG(`LEN`)*AVG(`TTWO`))*252 AS `COVARIANCE`
+FROM
+(SELECT `RT1`.`returns` AS `LEN`, `RT2`.`returns` AS `TTWO`
+FROM `RT1` as `RT1`
+INNER JOIN `RT2` AS `RT2` ON `RT1`.`date` = `RT2`.`date`) A;
+
+END $$
+DELIMITER ;
+
+-----------------------------------------------------------------------------------------------------------------
+
+USE invest;
+/* Analysis of distribution of all the tickers,
+used compound returns, used the square root of variance to calculate sigma/risk.
+Used 252 days as the average trading days in a year */
+SELECT 
+	`ticker`, 
+    `security_name`, 
+    `major_asset_class`,
+    POW(1+AVG(`returns`),252)-1 AS `MU`,sqrt((variance(`returns`)*252)) AS `SIGMA`, 
+    variance(`returns`)*252 as `VARIANCE`,
+     (POW(1+AVG(`returns`),252)-1)/(sqrt((variance(`returns`)*252))) AS `risk_adj_returns`
+FROM
+	(SELECT `date`, `ticker`,`security_name`,`major_asset_class`,
+	ln(`value`/`lagged_price`) AS `returns`
+FROM
+	(SELECT `pcn`.`date`,`pcn`.`value`,`pcn`.`ticker`,`sml`.`security_name`,`sml`.`major_asset_class`,
+	LAG(`value`,1) OVER (PARTITION BY `ticker` ORDER BY `date`) AS `lagged_price`
+FROM `invest`.`pricing_daily_new` AS `pcn`
+INNER JOIN `security_masterlist` AS `sml` 
+	ON `sml`.`ticker` = `pcn`.`ticker`
+WHERE `price_type` = 'Adjusted'
+AND TIMESTAMPDIFF(DAY,`pcn`.`date`,'2022-09-09')<=(365)) A)B
+GROUP BY `ticker`;
+
+-----------------------------------------------------------------------------------------------------------------
+
+use invest;
+/* Creates bins for every client based on their net worth */
+SELECT 
+    `full_name`,
+    `account_id`,
+    `Total_Networth`,
+    CASE
+        WHEN `TOTAL_NETWORTH` BETWEEN 0 AND 1000000 THEN 'TIER 1'
+        WHEN `TOTAL_NETWORTH` BETWEEN 1000000 AND 2000000 THEN 'TIER 2'
+        WHEN `TOTAL_NETWORTH` BETWEEN 2000000 AND 3000000 THEN 'TIER 3'
+        ELSE 'TIER 4'
+    END AS `NW_TIER`
+FROM
+    (SELECT 
+        (`cd`.`full_name`),
+            `hc`.`account_id`,
+            ROUND(SUM(hc.`value` * `hc`.`quantity`)) AS `Total_Networth`
+    FROM
+        `account_dim` AS ad
+    LEFT JOIN `customer_details` AS `cd` ON `cd`.`row_names` = `ad`.`row_names`
+    INNER JOIN `holdings_current` AS `hc` ON `hc`.`account_id` = `ad`.`account_id`
+    WHERE
+        `hc`.`price_type` = 'Adjusted'
+            AND `ad`.`opt38_desc` = 'main'
+    GROUP BY `cd`.`full_name`) `customer_nw`
+    ORDER BY `NW_TIER` DESC;
+-----------------------------------------------------------------------------------------------------------------
+
+
+USE `invest`;
+
+/* These are the portfolios for all of our selected clients
+as well the returns, risk, variance and risk adjusted returns for 
+every owned ticker */
+
+WITH `total_net_worth` AS(
+SELECT account_id,
+       SUM(`value`*`quantity`) AS `net_worth`
+       FROM `holdings_current`
+       GROUP BY `account_id`),
+       
+/* Normalise Major asset classification into 4 categories */        
+`asset_class_modified` AS(SELECT 
+	`ticker`,
+CASE WHEN `major_asset_class` IN ('equity','equty') THEN 'Equity'
+	 WHEN `major_asset_class` IN ('fixed_income','fixed income','fixed income corporate') THEN 'Fixed Income' 
+	 ELSE `major_asset_class` END AS `major_asset_class`,
+     `minor_asset_class`
+FROM `security_masterlist`
+GROUP BY asset_class),
+
+/* Returns for 12, 18 and 24 months */
+`returns_new_12M` AS (SELECT `pdn_adjusted`.`date`, `pdn_adjusted`.`ticker`, `pdn_adjusted`.`security_name`,
+CONCAT(ROUND(((`pdn_adjusted`.`value`-`pdn_adjusted`.`lagged_price`)/`pdn_adjusted`.`lagged_price`)*100,2),'%') AS `returns`
+FROM
+(SELECT `pcn`.`date`,`pcn`.`value`,`pcn`.`ticker`,`sml`.`security_name`,
+	LAG(`value`,250) OVER (PARTITION BY `ticker` ORDER BY `date`) AS `lagged_price`
+FROM `invest`.`pricing_daily_new` AS `pcn`
+INNER JOIN `security_masterlist` AS `sml` ON `sml`.`ticker` = `pcn`.`ticker`
+WHERE `price_type` = 'Adjusted') `pdn_adjusted`
+WHERE `DATE` = (SELECT MAX(DATE) FROM `invest`.`pricing_daily_new`)),
+
+`returns_new_18M` AS (SELECT `pdn_adjusted`.`date`, `pdn_adjusted`.`ticker`, `pdn_adjusted`.`security_name`,
+CONCAT(ROUND(((`pdn_adjusted`.`value`-`pdn_adjusted`.`lagged_price`)/`pdn_adjusted`.`lagged_price`)*100,2),'%') AS `returns`
+FROM
+(SELECT `pcn`.`date`,`pcn`.`value`,`pcn`.`ticker`,`sml`.`security_name`,
+	LAG(`value`,378) OVER (PARTITION BY `ticker` ORDER BY `date`) AS `lagged_price`
+FROM `invest`.`pricing_daily_new` AS `pcn`
+INNER JOIN `security_masterlist` AS `sml` ON `sml`.`ticker` = `pcn`.`ticker`
+WHERE `price_type` = 'Adjusted') `pdn_adjusted`
+WHERE `DATE` = (SELECT MAX(DATE) FROM `invest`.`pricing_daily_new`)),
+
+`returns_new_24M` AS (SELECT `pdn_adjusted`.`date`, `pdn_adjusted`.`ticker`, `pdn_adjusted`.`security_name`,
+CONCAT(ROUND(((`pdn_adjusted`.`value`-`pdn_adjusted`.`lagged_price`)/`pdn_adjusted`.`lagged_price`)*100,2),'%') AS `returns`
+FROM
+(SELECT `pcn`.`date`,`pcn`.`value`,`pcn`.`ticker`,`sml`.`security_name`,
+	LAG(`value`,500) OVER (PARTITION BY `ticker` ORDER BY `date`) AS `lagged_price`
+FROM `invest`.`pricing_daily_new` AS `pcn`
+INNER JOIN `security_masterlist` AS `sml` ON `sml`.`ticker` = `pcn`.`ticker`
+WHERE `price_type` = 'Adjusted') `pdn_adjusted`
+WHERE `DATE` = (SELECT MAX(DATE) FROM `invest`.`pricing_daily_new`)),
+
+/* Returns, variance, risk and risk adjusted returns using the compounded returns formula (ln(P1/P0))*/
+`risk` as 
+(SELECT 
+	`ticker`, 
+    `security_name`, 
+    POW(1+AVG(`returns`),252)-1 AS `MU`,sqrt((variance(`returns`)*252)) AS `SIGMA`, 
+    variance(`returns`)*252 as `VARIANCE`,
+     (POW(1+AVG(`returns`),252)-1)/(sqrt((variance(`returns`)*252))) AS `risk_adj_returns`
+FROM
+	(SELECT `date`, `ticker`,`security_name`,
+	ln(`value`/`lagged_price`) AS `returns`
+FROM
+	(SELECT `pcn`.`date`,`pcn`.`value`,`pcn`.`ticker`,`sml`.`security_name`,
+	LAG(`value`,1) OVER (PARTITION BY `ticker` ORDER BY `date`) AS `lagged_price`
+FROM `invest`.`pricing_daily_new` AS `pcn`
+INNER JOIN `security_masterlist` AS `sml` 
+	ON `sml`.`ticker` = `pcn`.`ticker`
+WHERE `price_type` = 'Adjusted'
+AND TIMESTAMPDIFF(DAY,`pcn`.`date`,'2022-09-09')<=(365)) A)B
+GROUP BY `ticker`)
+
+/* Joins all tables to obtain information on all the secutrities owned by our selected clients*/
+SELECT     `hc`.`account_id`,
+		   `hc`.`ticker`,
+           `rn12`.`security_name`,
+           `rn12`.`returns` as 'Returns 12 Months',
+           `rn18`.`returns` as 'Returns 18 Months',
+           `rn24`.`returns` as 'Returns 24 Months',
+		   SUM(`value`*`quantity`) AS `total_of_each_ticker`,
+           CONCAT(ROUND(SUM(`value`*`quantity`)/`tnw`.`net_worth`*100,2),'%') as `proportion_of_each_ticker`,
+           `acf`.`major_asset_class`,
+           `acf`.`minor_asset_class`,
+           `r`.`mu`,
+           `r`.`sigma`,
+           `r`.`variance`,
+           `r`.`risk_adj_returns`
+FROM `holdings_current` as `hc`
+INNER JOIN `total_net_worth` as `tnw`
+ON `hc`.`account_id`=`tnw`.`account_id`
+INNER JOIN `asset_class_modified` as `acf`
+ON `hc`.`ticker`=`acf`.`ticker`
+INNER JOIN `returns_new_12M` as `rn12`
+ON `hc`.`ticker`=`rn12`.`ticker`
+INNER JOIN `returns_new_18M` as `rn18`
+ON `hc`.`ticker`=`rn18`.`ticker`
+INNER JOIN `returns_new_24M` as `rn24`
+ON `hc`.`ticker`=`rn24`.`ticker`
+INNER JOIN `risk` as `r`
+on `hc`.`ticker`=`r`.`ticker`
+WHERE `hc`.`account_id` LIKE '%151%' OR `hc`.`account_id` LIKE '%227%' OR 
+`hc`.`account_id` LIKE '%286%' OR `hc`.`account_id` LIKE '%524%' 
+GROUP BY `account_id`,`ticker`
+ORDER BY `account_id`
+;
+
+-----------------------------------------------------------------------------------------------------------------
+
+
+USE invest;
+/* Gives Weighted Returns and Weighted Risk for every client */
+WITH `total_net_worth` AS(
+SELECT account_id,
+       SUM(`value`*`quantity`) AS `net_worth`
+       FROM `holdings_current`
+       GROUP BY `account_id`),
+/* Normalise Major asset classification into 4 categories */       
+`asset_class_modified` AS(SELECT 
+	`ticker`,
+CASE WHEN `major_asset_class` IN ('equity','equty') THEN 'Equity'
+	 WHEN `major_asset_class` IN ('fixed_income','fixed income') THEN 'Fixed Income' 
+	 ELSE `major_asset_class` END AS `major_asset_class`,
+     `minor_asset_class`
+FROM `security_masterlist`
+GROUP BY asset_class),
+/* Creates table with returns, risk, variance and risk adjusted returns for all securities */
+`risk` as 
+(SELECT 
+	`ticker`, 
+    `security_name`, 
+    POW(1+AVG(`returns`),252)-1 AS `MU`,sqrt((variance(`returns`)*252)) AS `SIGMA`, 
+    variance(`returns`)*252 as `VARIANCE`,
+     (POW(1+AVG(`returns`),252)-1)/(sqrt((variance(`returns`)*252))) AS `risk_adj_returns`
+FROM
+	(SELECT `date`, `ticker`,`security_name`,
+	ln(`value`/`lagged_price`) AS `returns`
+FROM
+	(SELECT `pcn`.`date`,`pcn`.`value`,`pcn`.`ticker`,`sml`.`security_name`,
+	LAG(`value`,1) OVER (PARTITION BY `ticker` ORDER BY `date`) AS `lagged_price`
+FROM `invest`.`pricing_daily_new` AS `pcn`
+INNER JOIN `security_masterlist` AS `sml` 
+	ON `sml`.`ticker` = `pcn`.`ticker`
+WHERE `price_type` = 'Adjusted'
+AND TIMESTAMPDIFF(DAY,`pcn`.`date`,'2022-09-09')<=(365)) A)B
+GROUP BY `ticker`)
+
+/* Joins the tables to create new table with weighted returns and risks for every security */
+SELECT     `hc`.`account_id`,
+           SUM((`r`.`mu`)*((`value`*`quantity`)/`tnw`.`net_worth`)) as `weighted_returns`,
+           SUM((`r`.`sigma`)*((`value`*`quantity`)/`tnw`.`net_worth`)) as `weighted_risk`
+FROM `holdings_current` as `hc`
+INNER JOIN `total_net_worth` as `tnw`
+ON `hc`.`account_id`=`tnw`.`account_id`
+INNER JOIN `asset_class_modified` as `acf`
+ON `hc`.`ticker`=`acf`.`ticker`
+INNER JOIN `risk` as `r`
+ON `hc`.`ticker`=`r`.`ticker`
+GROUP BY `account_id`
+;
+
