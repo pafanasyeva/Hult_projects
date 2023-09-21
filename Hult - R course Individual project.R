@@ -18,7 +18,7 @@ library(neuralnet)
 library(VIM)
 
 
-setwd("C:/Users/polin/Desktop/HULT/R/Hult_R_Classes/BAN1_Case_Info/A2_Hospital_Readmission/caseData")
+setwd("C:/Users/<...>/caseData")
 
 #Cleaning the environment
 #rm(list=ls())
